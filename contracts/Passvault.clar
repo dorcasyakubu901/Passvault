@@ -13,11 +13,17 @@
 (define-constant ERR_BORDER_NOT_REGISTERED (err u106))
 (define-constant ERR_ALREADY_VERIFIED (err u107))
 (define-constant ERR_INVALID_EXPIRY (err u108))
+(define-constant ERR_HISTORY_NOT_FOUND (err u109))
+(define-constant ERR_INVALID_SCORE_RANGE (err u110))
+(define-constant ERR_INSUFFICIENT_TRAVEL_HISTORY (err u111))
+(define-constant ERR_INVALID_DATE_RANGE (err u112))
 
 (define-data-var next-voucher-id uint u1)
 (define-data-var total-vouchers-issued uint u0)
 (define-data-var total-vouchers-used uint u0)
 (define-data-var border-crossing-fee uint u1000000)
+(define-data-var total-travel-records uint u0)
+(define-data-var next-travel-record-id uint u1)
 
 (define-map vouchers
   { voucher-id: uint }
@@ -55,6 +61,54 @@
     base-fee: uint,
     validity-blocks: uint,
     is-active: bool
+  }
+)
+
+(define-map travel-history
+  { record-id: uint }
+  {
+    traveler: principal,
+    voucher-id: uint,
+    from-border: (string-ascii 50),
+    to-border: (string-ascii 50),
+    travel-date: uint,
+    voucher-type: (string-ascii 20),
+    success-status: bool,
+    verification-authority: principal
+  }
+)
+
+(define-map traveler-profile
+  { traveler: principal }
+  {
+    total-crossings: uint,
+    successful-crossings: uint,
+    trust-score: uint,
+    first-travel-date: uint,
+    last-travel-date: uint,
+    preferred-voucher-type: (string-ascii 20),
+    total-countries-visited: uint
+  }
+)
+
+(define-map country-statistics
+  { country-code: (string-ascii 10) }
+  {
+    total-entries: uint,
+    total-exits: uint,
+    unique-travelers: uint,
+    most-common-voucher-type: (string-ascii 20),
+    peak-travel-period: uint
+  }
+)
+
+(define-map border-pair-analytics
+  { from-border: (string-ascii 50), to-border: (string-ascii 50) }
+  {
+    crossing-count: uint,
+    average-processing-time: uint,
+    success-rate: uint,
+    last-crossing-date: uint
   }
 )
 
@@ -279,4 +333,219 @@
                              u0)
     })
   )
+)
+
+(define-public (record-travel (voucher-id uint) (from-border (string-ascii 50)) (to-border (string-ascii 50)) (success-status bool))
+  (let
+    (
+      (voucher (unwrap! (map-get? vouchers { voucher-id: voucher-id }) ERR_VOUCHER_NOT_FOUND))
+      (record-id (var-get next-travel-record-id))
+      (current-height stacks-block-height)
+      (traveler (get owner voucher))
+      (voucher-type (get voucher-type voucher))
+      (profile (default-to 
+        {
+          total-crossings: u0,
+          successful-crossings: u0,
+          trust-score: u50,
+          first-travel-date: current-height,
+          last-travel-date: current-height,
+          preferred-voucher-type: voucher-type,
+          total-countries-visited: u0
+        }
+        (map-get? traveler-profile { traveler: traveler })
+      ))
+    )
+    (asserts! (get is-used voucher) ERR_VOUCHER_NOT_FOUND)
+    (asserts! (get is-verified voucher) ERR_NOT_AUTHORIZED)
+    
+    (map-set travel-history
+      { record-id: record-id }
+      {
+        traveler: traveler,
+        voucher-id: voucher-id,
+        from-border: from-border,
+        to-border: to-border,
+        travel-date: current-height,
+        voucher-type: voucher-type,
+        success-status: success-status,
+        verification-authority: (unwrap-panic (get verification-authority voucher))
+      }
+    )
+    
+    (unwrap! (update-traveler-profile traveler voucher-type success-status current-height profile) ERR_NOT_AUTHORIZED)
+    (unwrap! (update-border-analytics from-border to-border success-status current-height) ERR_NOT_AUTHORIZED)
+    
+    (var-set next-travel-record-id (+ record-id u1))
+    (var-set total-travel-records (+ (var-get total-travel-records) u1))
+    
+    (ok record-id)
+  )
+)
+
+(define-private (update-traveler-profile (traveler principal) (voucher-type (string-ascii 20)) (success-status bool) (travel-date uint) (current-profile {total-crossings: uint, successful-crossings: uint, trust-score: uint, first-travel-date: uint, last-travel-date: uint, preferred-voucher-type: (string-ascii 20), total-countries-visited: uint}))
+  (begin
+    (let
+      (
+        (new-total-crossings (+ (get total-crossings current-profile) u1))
+        (new-successful-crossings (if success-status 
+                                    (+ (get successful-crossings current-profile) u1)
+                                    (get successful-crossings current-profile)))
+        (success-rate (if (> new-total-crossings u0)
+                        (/ (* new-successful-crossings u100) new-total-crossings)
+                        u0))
+        (new-trust-score (calculate-trust-score success-rate new-total-crossings))
+        (first-date (if (< travel-date (get first-travel-date current-profile))
+                      travel-date
+                      (get first-travel-date current-profile)))
+      )
+      (map-set traveler-profile
+        { traveler: traveler }
+        {
+          total-crossings: new-total-crossings,
+          successful-crossings: new-successful-crossings,
+          trust-score: new-trust-score,
+          first-travel-date: first-date,
+          last-travel-date: travel-date,
+          preferred-voucher-type: voucher-type,
+          total-countries-visited: (+ (get total-countries-visited current-profile) u1)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-trust-score (success-rate uint) (total-crossings uint))
+  (let
+    (
+      (base-score (* success-rate u1))
+      (experience-bonus (if (>= total-crossings u10) u10 (/ total-crossings u1)))
+      (final-score (+ base-score experience-bonus))
+    )
+    (if (> final-score u100) u100 final-score)
+  )
+)
+
+(define-private (update-border-analytics (from-border (string-ascii 50)) (to-border (string-ascii 50)) (success-status bool) (travel-date uint))
+  (begin
+    (let
+      (
+        (current-analytics (default-to
+          {
+            crossing-count: u0,
+            average-processing-time: u1,
+            success-rate: u100,
+            last-crossing-date: travel-date
+          }
+          (map-get? border-pair-analytics { from-border: from-border, to-border: to-border })
+        ))
+        (new-crossing-count (+ (get crossing-count current-analytics) u1))
+        (current-successes (* (get success-rate current-analytics) (get crossing-count current-analytics)))
+        (new-total-successes (if success-status (+ current-successes u100) current-successes))
+        (new-success-rate (if (> new-crossing-count u0) (/ new-total-successes new-crossing-count) u0))
+      )
+      (map-set border-pair-analytics
+        { from-border: from-border, to-border: to-border }
+        {
+          crossing-count: new-crossing-count,
+          average-processing-time: (get average-processing-time current-analytics),
+          success-rate: new-success-rate,
+          last-crossing-date: travel-date
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (get-traveler-analytics (traveler principal))
+  (let
+    (
+      (profile (map-get? traveler-profile { traveler: traveler }))
+      (voucher-count (get-user-voucher-count traveler))
+    )
+    (ok {
+      profile: profile,
+      voucher-count: voucher-count,
+      travel-frequency: (if (is-some profile)
+                          (calculate-travel-frequency traveler)
+                          u0)
+    })
+  )
+)
+
+(define-read-only (calculate-travel-frequency (traveler principal))
+  (let
+    (
+      (profile (unwrap! (map-get? traveler-profile { traveler: traveler }) u0))
+      (travel-span (- (get last-travel-date profile) (get first-travel-date profile)))
+      (total-crossings (get total-crossings profile))
+    )
+    (if (and (> travel-span u0) (> total-crossings u1))
+      (/ total-crossings travel-span)
+      u0)
+  )
+)
+
+(define-public (get-border-analytics (from-border (string-ascii 50)) (to-border (string-ascii 50)))
+  (ok (map-get? border-pair-analytics { from-border: from-border, to-border: to-border }))
+)
+
+(define-public (get-travel-history-by-traveler (traveler principal) (limit uint) (offset uint))
+  (let
+    (
+      (profile (map-get? traveler-profile { traveler: traveler }))
+    )
+    (ok {
+      profile: profile,
+      has-history: (is-some profile)
+    })
+  )
+)
+
+(define-read-only (get-trust-level (trust-score uint))
+  (if (>= trust-score u90)
+    "PLATINUM"
+    (if (>= trust-score u75)
+      "GOLD"
+      (if (>= trust-score u60)
+        "SILVER"
+        "BRONZE")))
+)
+
+(define-public (apply-trust-discount (traveler principal) (base-fee uint))
+  (let
+    (
+      (profile (map-get? traveler-profile { traveler: traveler }))
+      (trust-score (if (is-some profile) 
+                     (get trust-score (unwrap-panic profile))
+                     u50))
+      (discount-rate (calculate-discount-rate trust-score))
+    )
+    (ok (- base-fee (/ (* base-fee discount-rate) u100)))
+  )
+)
+
+(define-read-only (calculate-discount-rate (trust-score uint))
+  (if (>= trust-score u90)
+    u15
+    (if (>= trust-score u75)
+      u10
+      (if (>= trust-score u60)
+        u5
+        u0)))
+)
+
+(define-read-only (get-travel-statistics)
+  {
+    total-travel-records: (var-get total-travel-records),
+    total-vouchers-issued: (var-get total-vouchers-issued),
+    total-vouchers-used: (var-get total-vouchers-used),
+    next-travel-record-id: (var-get next-travel-record-id)
+  }
+)
+
+(define-read-only (get-travel-record (record-id uint))
+  (map-get? travel-history { record-id: record-id })
 )
