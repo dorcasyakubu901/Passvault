@@ -183,6 +183,7 @@
     (try! (add-voucher-type "BUSINESS" u750000 u2880))
     (try! (add-voucher-type "TRANSIT" u250000 u720))
     (try! (add-voucher-type "DIPLOMATIC" u0 u4320))
+    (try! (add-voucher-type "EMERGENCY" u0 u720))
     (ok true)
   )
 )
